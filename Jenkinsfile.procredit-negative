@@ -1,0 +1,187 @@
+// ProCredit REAL-BANK negative transfer tests. MANUAL RUN ONLY.
+// These tests click the FINAL "გადარიცხვა" button and can cause a real transaction
+// if the bank approves it (for example, an overdraft is available).
+// Keep this separate from the normal Jenkinsfile / automatically triggered CI.
+// Never configure SCM polling, webhook triggers, timers, or automatic rebuilds.
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timeout(time: 25, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '0'))
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_DESKTOP_NEGATIVE', defaultValue: false,
+            description: 'Run tests/test_procredit_negative_transfer.py (live bank, final transfer submit)')
+        booleanParam(name: 'RUN_MOBILE_NEGATIVE', defaultValue: false,
+            description: 'Run tests/test_procreditbank_mobile_negative_transfer.py (responsive 414x896, live bank, final submit)')
+        booleanParam(name: 'ALLOW_LIVE_BANK_FINAL_SUBMIT', defaultValue: false,
+            description: 'I authorize a single, attended final transfer-submit attempt in my real bank account.')
+        string(name: 'FINAL_SUBMIT_CONFIRMATION', defaultValue: '',
+            description: 'To approve, type exactly: I_APPROVE_LIVE_BANK_SUBMIT')
+        string(name: 'TERMUX_USER', defaultValue: 'u0_a321',
+            description: 'Termux SSH user')
+        string(name: 'TERMUX_KEY_PATH', defaultValue: 'C:\\ProgramData\\Jenkins\\.jenkins\\ssh\\termux_jenkins_v3',
+            description: 'Verified SSH private key for Jenkins SYSTEM account')
+        string(name: 'OTP_SENDER', defaultValue: 'ProCredit',
+            description: 'SMS sender name for both login OTP and transfer TAN')
+    }
+
+    environment {
+        BROWSER = 'chrome'
+        HEADLESS = 'false'
+        PYTHONUNBUFFERED = '1'
+        PRO_CREDIT_RUN = '0'
+        PRO_CREDIT_NEGATIVE_SUBMIT = 'NO'
+        PRO_CREDIT_MOBILE_NEGATIVE_SUBMIT = 'NO'
+    }
+
+    stages {
+        stage('Explicit human approval') {
+            steps {
+                script {
+                    // Force ONE real-bank final-submit attempt per Build, never both.
+                    if (params.RUN_DESKTOP_NEGATIVE == params.RUN_MOBILE_NEGATIVE) {
+                        error('Select exactly ONE: RUN_DESKTOP_NEGATIVE or RUN_MOBILE_NEGATIVE.')
+                    }
+                    if (!params.ALLOW_LIVE_BANK_FINAL_SUBMIT ||
+                        params.FINAL_SUBMIT_CONFIRMATION.trim() != 'I_APPROVE_LIVE_BANK_SUBMIT') {
+                        error('Real bank final submission requires explicit approval and the confirmation phrase.')
+                    }
+                    if (isUnix()) {
+                        error('ProCredit live SMS tests require this local Windows Jenkins agent.')
+                    }
+                    if (!(params.TERMUX_USER.trim() ==~ /[A-Za-z0-9_-]+/) ||
+                        !params.TERMUX_KEY_PATH.trim() || !params.OTP_SENDER.trim()) {
+                        error('TERMUX_USER, TERMUX_KEY_PATH and OTP_SENDER must be configured.')
+                    }
+                    echo(params.RUN_DESKTOP_NEGATIVE
+                        ? 'Approved manual live-bank test: DESKTOP negative transfer (single final submit).'
+                        : 'Approved manual live-bank test: MOBILE negative transfer (single final submit).')
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                deleteDir()
+                checkout scm
+                script {
+                    def testPath = params.RUN_DESKTOP_NEGATIVE
+                        ? 'tests/test_procredit_negative_transfer.py'
+                        : 'tests/test_procreditbank_mobile_negative_transfer.py'
+                    if (!fileExists(testPath)) {
+                        error("Selected test file does not exist in repository: ${testPath}")
+                    }
+                    if (!fileExists('requirements-ci.txt')) {
+                        error('requirements-ci.txt was not found in the repository root.')
+                    }
+                }
+            }
+        }
+
+        stage('Install requirements') {
+            steps {
+                bat '''
+                    @echo off
+                    python -m venv .venv
+                    if errorlevel 1 exit /b 1
+                    .venv\\Scripts\\python.exe -m pip install -r requirements-ci.txt
+                    if errorlevel 1 exit /b 1
+                    if not exist reports mkdir reports
+                '''
+            }
+        }
+
+        stage('Run ONE negative transfer [MANUAL, REAL BANK]') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'procredit-bank-user',
+                        usernameVariable: 'PRO_CREDIT_USERNAME',
+                        passwordVariable: 'PRO_CREDIT_PASSWORD'),
+                    file(credentialsId: 'procredit-negative-config',
+                        variable: 'PRO_CREDIT_CONFIG_FILE')
+                ]) {
+                    script {
+                        // The Secret file contains only non-login test data.
+                        // Never echo its contents or include it in archived artifacts.
+                        def config = [:]
+                        def content = readFile(file: env.PRO_CREDIT_CONFIG_FILE, encoding: 'UTF-8')
+                        content.replace("\uFEFF", '').split(/\r?\n/).each { row ->
+                                def line = row.trim()
+                                if (line && !line.startsWith('#')) {
+                                    def pair = line.split('=', 2)
+                                    if (pair.length == 2) {
+                                        config[pair[0].trim()] = pair[1].trim()
+                                    }
+                                }
+                            }
+
+                        def iban = (config['PRO_CREDIT_RECIPIENT_IBAN'] ?: '').replace(' ', '').toUpperCase()
+                        def recipient = (config['PRO_CREDIT_RECIPIENT_NAME'] ?: '').trim()
+                        def bankName = (config['PRO_CREDIT_EXPECTED_BANK_NAME'] ?: 'სს "თიბისი ბანკი"').trim()
+                        if (!(iban ==~ /GE[0-9]{2}[A-Z]{2}[0-9]{16}/)) {
+                            error('Secret file procredit-negative-config must contain a Georgian-format PRO_CREDIT_RECIPIENT_IBAN.')
+                        }
+                        if (!recipient || !bankName) {
+                            error('Secret file must contain PRO_CREDIT_RECIPIENT_NAME; expected bank name must not be empty.')
+                        }
+
+                        def testPath = params.RUN_DESKTOP_NEGATIVE
+                            ? 'tests/test_procredit_negative_transfer.py'
+                            : 'tests/test_procreditbank_mobile_negative_transfer.py'
+                        def reportPath = params.RUN_DESKTOP_NEGATIVE
+                            ? 'reports/procredit-negative-desktop.xml'
+                            : 'reports/procredit-negative-mobile.xml'
+                        def isMobile = params.RUN_MOBILE_NEGATIVE
+
+                        withEnv([
+                            'PRO_CREDIT_RUN=1',
+                            'HEADLESS=false',
+                            'PRO_CREDIT_NEGATIVE_SUBMIT=YES',
+                            "PRO_CREDIT_MOBILE_NEGATIVE_SUBMIT=${isMobile ? 'YES' : 'NO'}",
+                            "TERMUX_SSH_USER=${params.TERMUX_USER.trim()}",
+                            "TERMUX_SSH_KEY=${params.TERMUX_KEY_PATH.trim()}",
+                            'PROCREDIT_OTP_LENGTH=4',
+                            "PROCREDIT_SMS_SENDER=${params.OTP_SENDER.trim()}",
+                            "PRO_CREDIT_RECIPIENT_IBAN=${iban}",
+                            "PRO_CREDIT_RECIPIENT_NAME=${recipient}",
+                            "PRO_CREDIT_EXPECTED_BANK_NAME=${bankName}"
+                        ]) {
+                            // No retries: an uncertain bank response must be reviewed manually.
+                            // A failure stops the pipeline; no other live submission can follow.
+                            bat ".venv\\Scripts\\python.exe -m pytest ${testPath} -v --junitxml=${reportPath}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // Jenkins test status is useful, but screenshots / HTML / Allure of a
+                // real bank session may expose private account and recipient data.
+                if (fileExists('reports/procredit-negative-desktop.xml') ||
+                    fileExists('reports/procredit-negative-mobile.xml')) {
+                    junit allowEmptyResults: true, testResults: 'reports/procredit-negative-*.xml'
+                }
+                // Do not archive any real-bank screenshots or HTML / Allure.
+                bat(returnStatus: true, script: '''
+                    @echo off
+                    if exist "html" rmdir /s /q "html"
+                    if exist "reports\\html" rmdir /s /q "reports\\html"
+                    if exist "reports\\screenshots" rmdir /s /q "reports\\screenshots"
+                    if exist "allure-results" rmdir /s /q "allure-results"
+                    if exist "allure-report" rmdir /s /q "allure-report"
+                ''')
+                echo 'Real-bank screenshots and HTML/Allure artifacts are not published.'
+            }
+        }
+    }
+}

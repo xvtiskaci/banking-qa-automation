@@ -1,0 +1,122 @@
+// Standalone API pipeline. The POST transfer runs only after an explicit build parameter.
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_API_TRANSFER', defaultValue: false, description: 'Explicitly allow POST transfer of DEMO funds')
+        string(name: 'PARABANK_URL', defaultValue: 'http://localhost:8081/parabank', description: 'ParaBank URL accessible from this Jenkins agent')
+        string(name: 'FROM_ACCOUNT', defaultValue: '', description: 'Demo source account ID')
+        string(name: 'TO_ACCOUNT', defaultValue: '', description: 'Demo destination account ID')
+        string(name: 'TRANSFER_AMOUNT', defaultValue: '1.00', description: 'Demo amount')
+    }
+
+    environment {
+        PYTHONUNBUFFERED = '1'
+        PRO_CREDIT_RUN = '0'
+        PRO_CREDIT_NEGATIVE_SUBMIT = 'NO'
+        PRO_CREDIT_MOBILE_NEGATIVE_SUBMIT = 'NO'
+        PARABANK_API_TRANSFER_RUN = 'NO'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { deleteDir(); checkout scm }
+        }
+        stage('Validate demo inputs') {
+            when { expression { return params.RUN_API_TRANSFER } }
+            steps {
+                script {
+                    def source = params.FROM_ACCOUNT.trim()
+                    def dest = params.TO_ACCOUNT.trim()
+                    def amt = params.TRANSFER_AMOUNT.trim()
+                    if (!(source ==~ /[0-9]+/) || !(dest ==~ /[0-9]+/) || source == dest) {
+                        error('Enter two different numeric demo account IDs.')
+                    }
+                    if (!(amt ==~ /[0-9]+(\.[0-9]{1,2})?/) || !(amt ==~ /.*[1-9].*/)) {
+                        error('TRANSFER_AMOUNT must be positive with max two decimal places.')
+                    }
+                }
+            }
+        }
+        stage('Install dependencies') {
+            steps {
+                script {
+                    if (isUnix()) {
+                        sh '''
+                            set -eu
+                            python3 -m venv .venv
+                            .venv/bin/python -m pip install -r requirements-ci.txt
+                        '''
+                    } else {
+                        bat '''
+                            @echo off
+                            python -m venv .venv
+                            if errorlevel 1 exit /b 1
+                            .venv\\Scripts\\python.exe -m pip install -r requirements-ci.txt
+                            if errorlevel 1 exit /b 1
+                        '''
+                    }
+                }
+            }
+        }
+        stage('API unit tests') {
+            steps {
+                script {
+                    if (isUnix()) {
+                        sh '''
+                            mkdir -p reports
+                            .venv/bin/python -m pytest unit_tests/test_parabank_api_client.py -v --alluredir=allure-results --junitxml=reports/api-unit.xml
+                        '''
+                    } else {
+                        bat '''
+                            @echo off
+                            if not exist reports mkdir reports
+                            .venv\\Scripts\\python.exe -m pytest unit_tests/test_parabank_api_client.py -v --alluredir=allure-results --junitxml=reports/api-unit.xml
+                        '''
+                    }
+                }
+            }
+        }
+        stage('API demo GET-POST-GET [opt-in]') {
+            when { expression { return params.RUN_API_TRANSFER } }
+            steps {
+                withEnv([
+                    "PARABANK_BASE_URL=${params.PARABANK_URL.trim()}",
+                    "PARABANK_FROM_ACCOUNT=${params.FROM_ACCOUNT.trim()}",
+                    "PARABANK_TO_ACCOUNT=${params.TO_ACCOUNT.trim()}",
+                    "PARABANK_TRANSFER_AMOUNT=${params.TRANSFER_AMOUNT.trim()}",
+                    'PARABANK_API_TRANSFER_RUN=YES'
+                ]) {
+                    script {
+                        if (isUnix()) {
+                            sh '.venv/bin/python -m pytest api_tests/test_parabank_api_transfer.py -v --alluredir=allure-results --junitxml=reports/api-transfer.xml'
+                        } else {
+                            bat '.venv\\Scripts\\python.exe -m pytest api_tests/test_parabank_api_transfer.py -v --alluredir=allure-results --junitxml=reports/api-transfer.xml'
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (fileExists('reports')) {
+                    junit allowEmptyResults: true, testResults: 'reports/*.xml'
+                }
+                if (fileExists('allure-results')) {
+                    allure includeProperties: false, results: [[path: 'allure-results']]
+                }
+            }
+            archiveArtifacts artifacts: 'reports/**,allure-results/**', allowEmptyArchive: true
+        }
+    }
+}

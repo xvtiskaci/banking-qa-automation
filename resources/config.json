@@ -1,0 +1,6 @@
+{
+  "urls": {
+    "procreditbank": "https://online.procreditbank.ge/login",
+    "parabank": "http://localhost:8081/parabank"
+  }
+}

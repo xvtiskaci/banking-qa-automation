@@ -1,0 +1,101 @@
+// PRIVATE, MANUAL-ONLY Jenkins job; performs login/OTP checks but never submits a bank transfer.
+// Requires an attended Windows desktop session and working phone ADB/SSH port forwarding.
+pipeline {
+    agent { label 'windows-local-procredit' }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_DESKTOP_LOGIN', defaultValue: false, description: 'Run ProCredit desktop login with phone SMS OTP')
+        booleanParam(name: 'RUN_MOBILE_LOGIN', defaultValue: false, description: 'Run ProCredit responsive mobile login with phone SMS OTP')
+        string(name: 'TERMUX_USER', defaultValue: '', description: 'Termux SSH username, e.g. u0_a###')
+        string(name: 'TERMUX_KEY_PATH', defaultValue: '', description: 'Local private SSH key path accessible by Jenkins agent')
+        string(name: 'OTP_LENGTH', defaultValue: '6', description: 'Number of OTP digits in SMS')
+        string(name: 'OTP_SENDER', defaultValue: 'ProCredit', description: 'SMS sender name')
+    }
+
+    environment {
+        PYTHONUNBUFFERED = '1'
+        BROWSER = 'chrome'
+        HEADLESS = 'false'
+        PRO_CREDIT_RUN = '1'
+        PRO_CREDIT_NEGATIVE_SUBMIT = 'NO'
+        PRO_CREDIT_MOBILE_NEGATIVE_SUBMIT = 'NO'
+        PARABANK_API_TRANSFER_RUN = 'NO'
+    }
+
+    stages {
+        stage('Validate deliberate manual execution') {
+            steps {
+                script {
+                    if (!params.RUN_DESKTOP_LOGIN && !params.RUN_MOBILE_LOGIN) {
+                        error('Select at least one login scenario manually before starting.')
+                    }
+                    if (!params.TERMUX_USER.trim() || !params.TERMUX_KEY_PATH.trim()) {
+                        error('Termux SSH user and key path are required.')
+                    }
+                    if (!(params.OTP_LENGTH.trim() ==~ /[4-8]/)) {
+                        error('OTP_LENGTH must be between 4 and 8.')
+                    }
+                }
+            }
+        }
+        stage('Checkout') {
+            steps { deleteDir(); checkout scm }
+        }
+        stage('Install dependencies') {
+            steps {
+                bat '''
+                    @echo off
+                    python -m venv .venv
+                    if errorlevel 1 exit /b 1
+                    .venv\\Scripts\\python.exe -m pip install -r requirements-ci.txt
+                    if errorlevel 1 exit /b 1
+                    if not exist reports mkdir reports
+                '''
+            }
+        }
+        stage('ProCredit login tests (no transfer)') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'procredit-bank-user', usernameVariable: 'PRO_CREDIT_USERNAME', passwordVariable: 'PRO_CREDIT_PASSWORD')]) {
+                    withEnv([
+                        "TERMUX_SSH_USER=${params.TERMUX_USER.trim()}",
+                        "TERMUX_SSH_KEY=${params.TERMUX_KEY_PATH.trim()}",
+                        "PROCREDIT_OTP_LENGTH=${params.OTP_LENGTH.trim()}",
+                        "PROCREDIT_SMS_SENDER=${params.OTP_SENDER.trim()}"
+                    ]) {
+                        script {
+                            if (params.RUN_DESKTOP_LOGIN) {
+                                bat '.venv\\Scripts\\python.exe -m pytest tests/test_login.py -v --alluredir=allure-results --junitxml=reports/procredit-desktop.xml'
+                            }
+                            if (params.RUN_MOBILE_LOGIN) {
+                                bat '.venv\\Scripts\\python.exe -m pytest tests/test_procreditbank_mobile_login.py -v --alluredir=allure-results --junitxml=reports/procredit-mobile.xml'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (fileExists('reports')) {
+                    junit allowEmptyResults: true, testResults: 'reports/*.xml'
+                }
+                if (fileExists('allure-results')) {
+                    allure includeProperties: false, results: [[path: 'allure-results']]
+                }
+            }
+            // ProCredit screenshots and per-test HTML may include private bank data.
+            // Keep them on the private agent; publish only the basic JUnit summary.
+            archiveArtifacts artifacts: 'reports/*.xml', allowEmptyArchive: true
+        }
+    }
+}

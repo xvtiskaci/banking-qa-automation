@@ -1,0 +1,86 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        HEADLESS = 'true'
+        BROWSER = 'chrome'
+        PYTHONUNBUFFERED = '1'
+        PARABANK_BASE_URL = 'http://localhost:8081/parabank'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+        stage('Install Python dependencies') {
+            steps {
+                script {
+                    if (isUnix()) {
+                        sh '''
+                            set -eu
+                            python3 -m venv .venv
+                            .venv/bin/python -m pip install -r requirements-ci.txt
+                        '''
+                    } else {
+                        bat '''
+                            @echo off
+                            python -m venv .venv
+                            if errorlevel 1 exit /b 1
+                            .venv\\Scripts\\python.exe -m pip install -r requirements-ci.txt
+                            if errorlevel 1 exit /b 1
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Run Safe Smoke Tests') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'parabank-demo-user',
+                    usernameVariable: 'PARABANK_USERNAME',
+                    passwordVariable: 'PARABANK_PASSWORD'
+                )]) {
+                    script {
+                        if (isUnix()) {
+                            sh '''
+                                mkdir -p reports
+                                .venv/bin/python -m pytest tests/test_smoke_transfer_funds.py -v --alluredir=allure-results --clean-alluredir --junitxml=reports/junit.xml
+                            '''
+                        } else {
+                            bat '''
+                                @echo off
+                                if not exist reports mkdir reports
+                                .venv\\Scripts\\python.exe -m pytest tests/test_smoke_transfer_funds.py -v --alluredir=allure-results --clean-alluredir --junitxml=reports/junit.xml
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (fileExists('reports/junit.xml')) {
+                    junit testResults: 'reports/junit.xml'
+                } else {
+                    echo 'JUnit XML not present; test stage may not have run.'
+                }
+                if (fileExists('allure-results')) {
+                    allure includeProperties: false, results: [[path: 'allure-results']]
+                } else {
+                    echo 'No Allure results; report publication skipped.'
+                }
+            }
+            archiveArtifacts artifacts: 'allure-results/**,reports/**', allowEmptyArchive: true
+        }
+    }
+}
